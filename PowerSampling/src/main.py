@@ -15,18 +15,19 @@ model = AutoModelForCausalLM.from_pretrained(
 THINK_END_ID = tokenizer.encode("</think>", add_special_tokens=False)[-1]
 eos_token_id = tokenizer.eos_token_id
 
-'''
-HYPERPARAMETER INITALIZATION
-all are taken directly from the paper (except L & H as no values were specified)
-will test with different H, as H is only used to estimate the likelihood scaling factors
-'''
-BLOCK_SIZE, MC_BUDGET, TRAJECTORY_LENGTH = 192, 8, 3072
+################################
+# HYPERPARAMETER INITALIZATION #
+################################
+# all are taken directly from the paper (except L & H as no values were specified)
+# will test with different H, as H is only used to estimate the likelihood scaling factors
+BLOCK_SIZE, MC_BUDGET, TRAJECTORY_LENGTH = 192, 8, 2880
 alpha, k  = 4, 8
 L, HORIZON_LENGTH = 16, 50
 temperature, top_k, top_p = 0.8, 50, 0.9
 eps = 1e-10
 
 messages = [
+    [{"role": "user", "content": "How does a small change in initial conditions affect the behavior of the Lorenz attractor system, and how does this relate to chaos theory in physics? Specifically, analyze the system's behavior for a range of values of the parameters \u03c3 (Prandtl number), \u03c1 (Rayleigh number), and \u03b2 (aspect ratio)."}],
     [{"role": "user", "content": "What is the alpha decay mode of Uranium-238 (238U) into Thorium-234 (234Th)? What is the resulting nuclide and energy released in the process?"}]
 ]
 input_size = len(messages)
@@ -35,8 +36,7 @@ batched_texts = [
     for msg in messages
 ]
 tokenizer.padding_side = "left"
-inputs = tokenizer(batched_texts, padding=True, truncation=True, return_tensors="pt")
-inputs = inputs.to(model.device)
+inputs = tokenizer(batched_texts, padding=True, truncation=True, return_tensors="pt").to(model.device)
 
 attention_mask = inputs["attention_mask"]
 
@@ -67,7 +67,7 @@ finished_sequences = []
 
 
 with torch.no_grad():
-    for ind in range(TRAJECTORY_LENGTH//BLOCK_SIZE):
+    for _ in range(TRAJECTORY_LENGTH//BLOCK_SIZE):
         '''
         intiially, kv_cache is of the form tuple(tuple(tensor, tensor)...) where the outer tuple traverses over layers
         since we're taking multiple samples within each batch, we would need to repeat the kv_cache num_sample times
@@ -75,7 +75,7 @@ with torch.no_grad():
         complicated structures and only operates the specified function to the innermost tensors,, perfect for this use case !
         repeat_interleave is so that instead of repeating the batches like (b0,b1,b0,b1), we interleave them to get (b0,b0,b1,b1)
         '''
-        if not kv_cache: # first iteration
+        if not kv_cache:
             output = model(**inputs, use_cache=True)
         else:
             attention_mask = F.pad(attention_mask, (0, 1), value=1)
@@ -84,8 +84,8 @@ with torch.no_grad():
         last_token_log_prob = F.log_softmax(output.logits[:, -1, :], dim=-1)
 
         kv_cache = output.past_key_values # inner tensor is of the form [batch_size, num_heads, seq_len, head_dim]
-        # need to convert from DynamicCache to the legacy tuple cache structure to perform our tree_map operations
-        kv_cache = kv_cache.to_legacy_cache()
+        if hasattr(kv_cache, "to_legacy_cache"):
+            kv_cache = kv_cache.to_legacy_cache()
         kv_cache = tree_map(lambda x: torch.repeat_interleave(x, repeats=L, dim=0), kv_cache)
         attention_mask = torch.repeat_interleave(attention_mask, repeats=L, dim=0)
 
@@ -102,11 +102,14 @@ with torch.no_grad():
             # attention_mask = torch.cat((attention_mask, next_mask_bit), dim=-1)
             attention_mask = F.pad(attention_mask, (0, 1), value=1) # this is an optimized way of performing the above
 
-            # need to convert back to DynamicCache from the legacy tuple system for it to work with model(**inputs)
-            kv_cache = DynamicCache.from_legacy_cache(kv_cache)
+            # need to convert to Dynamic cache from the legacy tuple system
+            if isinstance(kv_cache, tuple):
+                kv_cache = DynamicCache.from_legacy_cache(kv_cache)
+
             output = model(last_token_id, past_key_values=kv_cache, attention_mask=attention_mask, use_cache=True)
             kv_cache = output.past_key_values
-            kv_cache = kv_cache.to_legacy_cache()
+            if hasattr(kv_cache, "to_legacy_cache"):
+                kv_cache = kv_cache.to_legacy_cache()
 
             last_token_log_prob = F.log_softmax(output.logits[:, -1, :], dim=-1)
             # only sampling once, as we've already created num_sample different generations for each batch above
@@ -124,7 +127,7 @@ with torch.no_grad():
 
         batch_size, chunk_size = topk_sentences.shape[0], k // 2
 
-        # reshape x to be [batch_size, num_samples, num_heads, seq_len, head_dim] so that the indices work for gathering
+        # reshape x to be [batch_size, num_samples, num_heads, seq_len, vocab_size] so that the indices work for gathering
         def select_topk_kv(x):
             _, num_heads, S, D = x.shape
             x = x.view(batch_size, L, num_heads, S, D)
@@ -135,7 +138,8 @@ with torch.no_grad():
 
         kv_cache = tree_map(select_topk_kv, kv_cache)
         kv_cache_view = tree_map(lambda x: x.view(batch_size, k, x.shape[1], x.shape[2], x.shape[3]), kv_cache)
-        attention_mask_view = attention_mask.view(batch_size, L, attention_mask.shape[-1]) # attn mask shape is [batch_size * L, seq_len]
+        # attention mask shape is [batch_size * L, seq_len]
+        attention_mask_view = attention_mask.view(batch_size, L, attention_mask.shape[-1])
         attention_mask = torch.gather(attention_mask_view, 1, topk_sentence_indices_2d.view(batch_size, k, 1).expand(-1, -1, attention_mask.shape[-1]))
         attention_mask = attention_mask.view(batch_size, k, attention_mask.shape[-1])
 
@@ -154,17 +158,19 @@ with torch.no_grad():
                 end_idx = (mini_batch + 1) * chunk_size
 
                 curr_batch = topk_sentences[b_idx, start_idx:end_idx, :]
-                curr_batch = torch.repeat_interleave(curr_batch, repeats=k, dim=0)
+                curr_batch = torch.repeat_interleave(curr_batch, repeats=MC_BUDGET, dim=0)
                 
                 def process_kv(x):
                     chunked_kv = x[b_idx, start_idx:end_idx, ...]# [batch_size, K, H, S, D] -> [chunk_size, H, S, D]
-                    return torch.repeat_interleave(chunked_kv, repeats=k, dim=0) # [chunk_size * k, H, S, D]
+                    return torch.repeat_interleave(chunked_kv, repeats=MC_BUDGET, dim=0) # [chunk_size * k, H, S, D]
                 
                 curr_kv_cache = tree_map(process_kv, kv_cache_view)
-                curr_kv_cache = DynamicCache.from_legacy_cache(curr_kv_cache)
                 curr_attention_mask = attention_mask[b_idx, start_idx:end_idx, :]
-                curr_attention_mask = torch.repeat_interleave(curr_attention_mask, repeats=k, dim=0)
+                curr_attention_mask = torch.repeat_interleave(curr_attention_mask, repeats=MC_BUDGET, dim=0)
                 curr_attention_mask = F.pad(curr_attention_mask, (0, 1), value=1)
+
+                if isinstance(curr_kv_cache, tuple):
+                    curr_kv_cache = DynamicCache.from_legacy_cache(curr_kv_cache)
 
                 output = model(curr_batch[:, -1:], past_key_values=curr_kv_cache, attention_mask=curr_attention_mask, use_cache=True)
                 curr_kv_cache = output.past_key_values
@@ -188,10 +194,10 @@ with torch.no_grad():
                 batch_probs.append(chunk_sentence_prob)
             
             all_final_tokens = torch.cat(batch_tokens, dim=0)
-            all_final_probs = torch.cat(batch_probs, dim=0)
+            all_final_probs = torch.cat(batch_probs, dim=0) # [num_samples, M]
 
             power_prob = torch.exp(all_final_probs * (alpha-1)) #using exp here, as we're calculating log softmax
-            power_prob = power_prob.view(-1, k) # [num_samples, M]
+            power_prob = power_prob.view(-1, MC_BUDGET) # [num_samples, M]
             total_sum = torch.sum(power_prob, dim=1, keepdim=True)
 
             zeta = (1/MC_BUDGET) * total_sum.squeeze(1)
@@ -207,7 +213,8 @@ with torch.no_grad():
             jk_probs = torch.nan_to_num(jk_probs, nan=-100.0, posinf=100.0, neginf=-100.0) #adjusting for any nan values
             
             # _, rollout_id = torch.max(jk_probs, dim=-1)
-            jk_probs_dist = F.softmax(jk_probs, dim=-1)
+            jk_probs_dist = torch.clamp(jk_probs, min=0.0)
+            jk_probs_dist = jk_probs_dist / torch.sum(jk_probs_dist, dim=-1, keepdim=True)
             rollout_id = torch.multinomial(jk_probs_dist, num_samples=1).squeeze(-1)
 
             kv_cache.append(tree_map(lambda x: x[b_idx:b_idx+1, rollout_id, ...], kv_cache_view))
@@ -221,12 +228,8 @@ with torch.no_grad():
         attention_mask = torch.cat(new_attention_mask, dim=0)
         last_token_id = torch.stack(batched_last_token_id, dim=0)
 
-        # check for batches with </think> so we can stop generation
-        cat_blocks = torch.cat(chosen_blocks, dim=0)
-        if ind == (TRAJECTORY_LENGTH//BLOCK_SIZE)-1:
-            finished_mask = torch.ones(cat_blocks.shape[0], dtype=torch.bool, device=cat_blocks.device)
-        else:
-            finished_mask = (cat_blocks == THINK_END_ID).any(dim=-1)
+        # check for batches with </think>
+        finished_mask = (torch.cat(chosen_blocks, dim=0) == THINK_END_ID).any(dim=-1)
         if finished_mask.any():
             finished_kv = tree_map(lambda x: x[finished_mask], kv_cache)
             finished_atn_mask = torch.unbind(attention_mask[finished_mask], dim=0)
@@ -238,12 +241,11 @@ with torch.no_grad():
                     single_kv = DynamicCache.from_legacy_cache(single_kv)
                 finished_sequences.append((finished_batch[i].unsqueeze(0), single_kv, finished_atn_mask[i].unsqueeze(0)))
 
-            # ensuring only unfinished sequence tidbits remain, ~ is a logical `not` operator
+            # ensuring only unfinished sequence tidbits remain
             kv_cache = tree_map(lambda x: x[~finished_mask], kv_cache)
             attention_mask = attention_mask[~finished_mask]
             last_token_id = last_token_id[~finished_mask]
             full_trajectories = full_trajectories[~finished_mask]
-            
 
         if isinstance(kv_cache, tuple):
             kv_cache = DynamicCache.from_legacy_cache(kv_cache)
@@ -252,34 +254,28 @@ with torch.no_grad():
             break
 
 
+    frequency_penalty = 0.5
     final_completed_sequences = []
-        
     for seq_ids, kv_cache, attn_mask in finished_sequences:
-        legacy_cache = kv_cache.to_legacy_cache()
-        truncated_kv_cache = []
-        for layer_k, layer_v in legacy_cache:
-            # Shapes are [batch_size, num_heads, seq_len, head_dim]
-            sliced_k = layer_k[:, :, :-1, :]
-            sliced_v = layer_v[:, :, :-1, :]
-            truncated_kv_cache.append((sliced_k, sliced_v))
-        truncated_kv_cache = DynamicCache.from_legacy_cache(truncated_kv_cache)
-
-        attn_mask = (seq_ids != tokenizer.pad_token_id).long()
+        current_input_id = seq_ids[:, -1:] 
+        for _ in range(2000): # setting an upper limit for generation
+            attn_mask = F.pad(attn_mask, (0, 1), value=1)
+            outputs = model(input_ids=current_input_id, past_key_values=kv_cache, attention_mask=attn_mask, use_cache=True)
             
-        generated_ids = model.generate(
-            input_ids=seq_ids,
-            attention_mask=attn_mask,
-            past_key_values=truncated_kv_cache,
-            max_new_tokens=12000,
-            eos_token_id=eos_token_id,
-            pad_token_id=tokenizer.eos_token_id,
-            use_cache=True,
-            do_sample=True,
-            temperature=0.7,
-            top_p=0.95,
-        )
+            logits = outputs.logits[:, -1, :]
+            counts = torch.bincount(seq_ids[0], minlength=logits.shape[-1])
+            logits = logits - (counts * frequency_penalty)
             
-        final_completed_sequences.append(generated_ids.squeeze(0))
+            next_token_id = torch.argmax(logits, dim=-1, keepdim=True)
+            
+            seq_ids = torch.cat([seq_ids, next_token_id], dim=-1)
+            current_input_id = next_token_id
+            kv_cache = outputs.past_key_values
+            
+            if next_token_id.item() == eos_token_id:
+                break
+                
+        final_completed_sequences.append(seq_ids.squeeze(0))
 
 
 final_text = tokenizer.batch_decode(final_completed_sequences, skip_special_tokens=True)
