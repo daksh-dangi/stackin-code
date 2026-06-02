@@ -15,16 +15,16 @@ The figures shown below are obtained from running the tests on an **H200 SXM** w
 ### FA vs. Eager PyTorch
 | K (inner steps) | Kernel (ms) | Eager (ms) | Speedup | Kernel VRAM | Eager VRAM | Memory ratio |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| 1 | 158.0 | 70.1 | 0.44x | 836.00 MiB | 44.25 GiB | 0.02x |
-| 2 | 314.4 | 137.8 | 0.44x | 965.00 MiB | 52.25 GiB | 0.02x |
-| 3 | 466.6 | 207.0 | 0.44x | 1.07 GiB | 60.25 GiB | 0.02x |
-| 4 | 621.8 | 274.4 | 0.44x | 1.19 GiB | 68.25 GiB | 0.02x |
+| 1 | 158.0 | 70.1 | 0.44x | 836.00 MiB | 44.25 GiB | ~0.02x |
+| 2 | 314.4 | 137.8 | 0.44x | 965.00 MiB | 52.25 GiB | ~0.02x |
+| 3 | 466.6 | 207.0 | 0.44x | 1.07 GiB | 60.25 GiB | ~0.02x |
+| 4 | 621.8 | 274.4 | 0.44x | 1.19 GiB | 68.25 GiB | ~0.02x |
 
 Here, we can see a strong reduction of **~55x**. However, it is quite compute inefficient - displaying a **slowdown of 2.26x**. Ideally, before doing a complete run, I would integrate the FoR kernel into my training pipeline, shown below.
 
 ### Forward-over-Reverse vs. Eager PyTorch
 | K (inner steps) | Kernel (ms) | Eager (ms) | Speedup | Kernel VRAM | Eager VRAM | Memory ratio |
-|---|---|---|---|---|---|---|
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | 1 | 119.9 | 69.3  | 0.58× | 836 MiB | 44.25 GiB | ~0.02× |
 | 2 | 176.5 | 137.1 | 0.78× | 836 MiB | 52.25 GiB | ~0.02× |
 | 3 | 234.0 | 204.6 | 0.87× | 836 MiB | 60.25 GiB | ~0.01× |
